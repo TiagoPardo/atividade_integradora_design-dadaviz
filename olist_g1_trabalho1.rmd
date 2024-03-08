@@ -1,0 +1,987 @@
+---
+title: "Analise de Dados - Olist"
+author: "Grupo 1 - André, Arnaldo, Giovanna, Isabella, Tiago"
+date: "2024-03-05"
+output: html_document
+encoding: UTF-8
+---
+
+# Descrição do problema
+
+Utilizar ferramentas de ciencia de dados para definir uma persona com base de dados da Olist.
+
+
+## Setup e Bibliotecas
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, cache= TRUE , warning = FALSE, message=FALSE)
+options(digits = 4) 
+```
+
+```{r Bibliotecas,message=FALSE, include=FALSE}
+library(ggcorrplot)
+library(conflicted)
+library(gbm)
+library(xgboost)
+library(pdp)
+library(survival)
+library(survminer)
+library(ISLR2) 
+library(naniar) 
+library(ranger) 
+library(rpart)
+library(rpart.plot)
+library(partykit) 
+library(GGally)
+library(vip) 
+library(tidymodels)
+library(DescTools)
+library(MASS) 
+library(glue)
+library(gapminder)
+library(ISLR)
+library(glmnet)
+library(plotmo)
+library(readxl)
+library(rmarkdown)
+library(devtools)
+library(tidyverse)
+library(skimr)
+library(dplyr)
+library(patchwork)
+library(rsample)
+library(FNN)
+library(yardstick)
+library(pROC)
+library(doParallel)
+
+library(tensorflow) 
+library("reticulate")
+#reticulate::use_python("C://ProgramData//anaconda3//python.exe")  #aquii
+library(devtools)
+library(keras)
+mnist <- dataset_mnist()
+library(topicmodels)
+library(wordcloud)
+library(tidytext)
+library(tm)
+library(keras)
+library(baguette)
+library(stringi)
+library(factoextra)
+library(ggrepel)
+library(patchwork)
+library(clustMixType)
+
+library(tidyverse)
+library(GGally)
+library(factoextra)
+library(ggrepel)
+library(plotly)
+library(cluster)
+
+library(esquisse)
+
+conflict_prefer("select", "dplyr")
+conflict_prefer("filter", "dplyr")
+```
+
+## Input da Base, ajustes básicos, transformação das bases em "visão cliente"
+```{r, leitura}
+df_customers <- read.csv("olist_customers_dataset.csv")
+df_orders <- read.csv("olist_orders_dataset.csv")
+df_reviews <- read.csv("olist_order_reviews_dataset.csv")
+df_payments <- read.csv("olist_order_payments_dataset.csv")
+df_items <- read.csv("olist_order_items_dataset.csv")
+df_products <- read.csv("olist_products_dataset.csv")
+df_geolocation <- read.csv("olist_geolocation_dataset.csv")
+
+#df_sellers <- read.csv("olist_products_dataset.csv") #não diz nada a respeito do cliente
+
+# verifica cassificação das variáveis
+df_customers %>% glimpse() 
+df_orders %>% glimpse()
+df_reviews %>% glimpse()
+df_payments %>% glimpse()
+df_items %>% glimpse()
+df_products %>% glimpse()
+df_geolocation %>% glimpse()
+
+# verifica nulos, distribuição dos dados e dados duplicados
+df_customers %>% skim()
+df_orders %>% skim()
+df_reviews %>% skim()
+df_payments %>% skim()
+df_items %>% skim()
+df_products %>% skim()
+df_geolocation %>% skim()
+
+## GEOLOCATION
+# Supondo que df_geolocation seja o seu data frame
+df_customers$customer_zip_code_prefix <- as.character(df_customers$customer_zip_code_prefix)
+df_geolocation$geolocation_zip_code_prefix <- as.character(df_geolocation$geolocation_zip_code_prefix)
+
+#dado que não temos o sufixo para cruzar com a geolocalização e obter a localização de forma exata, devemos tirar duplicidade de df_geolocation$geolocation_zip_code_prefix para o cruzamento com a base customers ser de n:1
+# Remover duplicatas pela chave geolocation_zip_code_prefix, mantendo a primeira ocorrência
+df_geolocation <- df_geolocation %>%
+  group_by(geolocation_zip_code_prefix) %>%
+  summarise(
+    geolocation_lat = median(geolocation_lat),
+    geolocation_lng = median(geolocation_lng),
+    geolocation_city = names(which.max(table(geolocation_city))),
+    geolocation_state = names(which.max(table(geolocation_state)))
+  ) %>%
+  ungroup()
+
+df_geolocation %>% glimpse()
+df_geolocation %>% skim()
+df_geolocation %>% view()
+
+## REVIEWS
+#verifica se há duplicidade nas reviews
+df_reviews$order_id %>% table() %>% sort(decreasing = TRUE) %>% head(10)
+df_reviews %>% filter(order_id=="03c939fd7fd3b38f8485a0f95798f1f6") %>% view()
+#observamos que uma mesma ordem de compra pode possuir diferentes reviews, pois o cliente acha que esta comprando tudo no mesmo lugar
+#e na verdade a olist envia separadamente o produto comprado de cada vendedor e gera avaliações e prazos de entrega diferentes para cada um, mesmo dentro de um mesmo pedido
+#para fins de clusterizar e personificar o cliente, temos que obter uma review por cliente e por isso retiraremos duplicidade mantendo a avaliação mais recente
+
+df_reviews$review_answer_timestamp <- as.POSIXct(df_reviews$review_answer_timestamp, format = "%Y-%m-%d %H:%M:%S")
+df_reviews$review_creation_date <- as.POSIXct(df_reviews$review_creation_date, format = "%Y-%m-%d %H:%M:%S")
+
+# Adicionar uma flag para clientes com dados duplicados
+df_reviews <- df_reviews %>%
+  group_by(order_id) %>%
+  mutate(quantidade_reviews = n())
+
+# Ordenar os dados pela data de criação da revisão (do mais recente para o mais antigo)
+df_reviews <- df_reviews %>%
+  arrange(order_id, desc(review_creation_date))
+
+# Remover duplicatas, mantendo apenas a primeira ocorrência para cada order_id
+df_reviews <- df_reviews %>%
+  distinct(order_id, .keep_all = TRUE)
+
+## PAYMENTS
+# uma mesma ordem pode possuir mais de um pagamento (não são para os diferentes vendedores), são pagamentos sequenciais suando voucher
+# entendendo isso vemos que faz sentido trazer somente o valor total por cliente
+top_10_mais_frequentes <- df_payments$order_id %>% table() %>% sort(decreasing = TRUE) %>% head(10) %>% names()
+df_payments[df_payments$order_id %in% top_10_mais_frequentes, ] %>% view()
+
+df_payments %>% filter(order_id=="ccf804e764ed5650cd8759557269dc13") %>% view()
+df_reviews %>% filter(order_id=="ccf804e764ed5650cd8759557269dc13") %>% view()
+
+
+df_payments %>% glimpse()
+df_payments %>% filter(payment_sequential==2) %>% .$payment_type %>% table()
+df_payments %>% filter(payment_sequential==3) %>% .$payment_type %>% table()
+df_payments %>% filter(payment_sequential>=4) %>% .$payment_type %>% table()
+
+casos_estudo <- df_payments %>% filter(payment_sequential == 2 & payment_type != "voucher") %>% pull(order_id)
+df_payments[df_payments$order_id %in% casos_estudo, ] %>% view()
+
+#obtenho lista de casos cujo payment_sequential maximo seja igual a 3
+df_payments %>%  group_by(order_id) %>%  filter(max(payment_sequential) == 3) %>% view() 
+
+df_payments %>% filter(order_id=="79b63d1f9cf0257b33b04fbfb0847cba") %>% view()
+
+#df_payments <- df_payments %>%
+#  mutate(payment_value = ifelse(order_id == "79b63d1f9cf0257b33b04fbfb0847cba" & payment_sequential == 1, 200, payment_value))
+
+
+#pega forma de pagamentto na qual cliente gastou mais dinheiro...
+df_payments_summary <- df_payments %>%
+  group_by(order_id, payment_type) %>%
+  summarise(total_payment_value = sum(payment_value)) %>%
+  group_by(order_id) %>%
+  top_n(1, total_payment_value) %>%
+  select(order_id, payment_type)
+
+df_payments %>% filter(order_id=="79b63d1f9cf0257b33b04fbfb0847cba") %>% view()
+
+df_payments <- df_payments %>%
+  group_by(order_id) %>%
+  summarise(
+    payment_value = sum(payment_value),
+    payment_installments = names(which.max(table(payment_installments))), #quantidade de parcelas. escolho a mais frequente, teoricamente devem ser todas duplicatas por order_id (não devem ter diferentes)
+    quantidade_de_formas_de__pagto = n() # Crio coluna contagem mais acertiva que payment_sequential que tem registros "esburacados"
+  ) 
+
+
+df_payments <- df_payments %>% 
+       left_join(df_payments_summary, by = "order_id") 
+
+df_payments %>% glimpse()
+df_payments %>% skim()
+
+#ITEMS
+df_items %>% skim()
+top_10_mais_frequentes <- df_items$order_id %>% table() %>% sort(decreasing = TRUE) %>% head(10) %>% names()
+df_items[df_items$order_id %in% top_10_mais_frequentes, ] %>% view()
+
+
+df_items %>% filter(order_id=="03c939fd7fd3b38f8485a0f95798f1f6") %>% view() # identificada inconsistencia, em que cliente que fez 3 reviews e reclamando que pagou 3 fretees e foram realziadas 3 entregas diferentes de um mesmo pedido tem order_item_id = 1 invés de 3 e aparece uma vez só na base
+
+df_reviews %>% filter(order_id=="2c2a19b5703863c908512d135aa6accc") %>% view() # já este caso de cliente com 12 pedidos tem apenas 1 review
+
+df_items %>% filter(order_id=="428a2f660dc84138d969ccd69a0ab6d5") %>% view()
+
+df_payments %>% filter(order_id=="428a2f660dc84138d969ccd69a0ab6d5") %>% view()
+
+#comparando com payments faz sentido transformar em visão cliente somando todos os preços e um mesmo id e todos os fretes de um mesmo id
+#invés de order_item_id fazer uma contagem da quantidade de items, pegar a moda do produto, seller e mediana do shippinng...
+
+
+df_items <- df_items %>%
+  group_by(order_id) %>%
+  summarise(
+    product_id = names(which.max(table(product_id))),
+    seller_id = names(which.max(table(seller_id))),
+    shipping_limit_date = names(which.max(table(shipping_limit_date))),
+    price = sum(price),
+    freight_value = sum(freight_value)
+  )
+
+df_items %>% skim()
+
+# cruzamento de base de dados
+df_visao_cliente <- df_customers %>% 
+       left_join(df_geolocation, by = c("customer_zip_code_prefix" = "geolocation_zip_code_prefix")) %>%
+       left_join(df_orders, by = "customer_id") %>%
+       left_join(df_reviews, by = "order_id") %>%
+       left_join(df_payments, by = "order_id") %>% 
+       left_join(df_items, by = "order_id") %>% 
+       left_join(df_products, by = "product_id")
+
+
+df_visao_cliente <- as_tibble(df_visao_cliente)
+
+df_visao_cliente %>% skim()
+
+#como o objetivo é clusterizar clientes vamos simplesmente eliminar dados nulos para não suja-los extipulando seus valores, dado que os mesmos também representam uma parcela muito pequena do total de casos
+df_visao_cliente <- na.omit(df_visao_cliente)
+
+df_visao_cliente %>% skim()
+df_visao_cliente %>% glimpse()
+
+##tratamento dos dados
+
+# exclusão de variaveis desnecessarias
+df_visao_cliente <- df_visao_cliente %>% select(-customer_city, -customer_state)
+
+
+## ajuste tipo das variaveis
+df_visao_cliente %>% glimpse()
+df_visao_cliente <- df_visao_cliente %>%
+  mutate(
+          geolocation_city = as.factor(geolocation_city),
+          geolocation_state = as.factor(geolocation_state),
+          order_status = as.factor(order_status),
+          order_purchase_timestamp = as.POSIXct(order_purchase_timestamp, format = "%Y-%m-%d %H:%M:%S"),
+          order_approved_at = as.POSIXct(order_approved_at, format = "%Y-%m-%d %H:%M:%S"),
+          order_delivered_carrier_date = as.POSIXct(order_delivered_carrier_date, format = "%Y-%m-%d %H:%M:%S"),
+          order_delivered_customer_date = as.POSIXct(order_delivered_customer_date, format = "%Y-%m-%d %H:%M:%S"),
+          order_estimated_delivery_date = as.Date(order_estimated_delivery_date),
+
+          review_creation_date = as.Date(review_creation_date),
+          review_answer_timestamp = as.POSIXct(review_answer_timestamp, format = "%Y-%m-%d %H:%M:%S"),
+
+          payment_installments = as.integer(payment_installments), # número de parcelas escolhidas para efetuar pgto
+          payment_type = as.factor(payment_type),
+          shipping_limit_date = as.POSIXct(shipping_limit_date, format = "%Y-%m-%d %H:%M:%S"),
+          product_category_name = as.factor(product_category_name)
+          )
+
+df_visao_cliente %>% glimpse()
+
+```
+
+## criação de features: 
+
+```{r}
+# Supondo que df_visao_cliente seja seu dataframe
+df_visao_cliente <- df_visao_cliente %>%
+  #mutate(day_of_week = lubridate::wday(order_purchase_timestamp, label = TRUE),  # Dia da semana em texto
+  mutate(
+         dia_da_semana_da_compra = as.factor(lubridate::wday(order_purchase_timestamp, week_start = 7)),  # número do dia da semana
+         numero_do_mes_da_compra = as.factor(lubridate::month(order_purchase_timestamp)), # número do Mês
+         tempo_previsto_de_entrega =  as.integer(difftime(order_estimated_delivery_date, order_purchase_timestamp, units = "days")), # em dias
+         atraso_na_entrega = as.integer(difftime(order_delivered_customer_date, order_estimated_delivery_date, units = "days")), # em dias
+         tempo_ate_review_apos_recebimento = as.integer(difftime(review_creation_date, order_delivered_customer_date, units = "days")) # em dias
+         #qtd_caracteres_review_title = as.integer(nchar(review_comment_title)),
+         #qtd_caracteres_review_message = as.integer(nchar(review_comment_message))
+         )  
+
+
+#df_visao_cliente %>% filter(tempo_ate_review_apos_recebimento!=0) %>% view()
+
+df_visao_cliente <- df_visao_cliente %>% na.omit()
+
+df_visao_cliente %>% glimpse()
+df_visao_cliente %>% dim()
+
+```
+
+
+## tidymodels
+Criação do recipe, prep e bake do tidymodels
+```{r}
+set.seed(123)
+(receita <- recipe(~ ., data = df_visao_cliente) %>%
+   step_rm(order_purchase_timestamp, order_approved_at, order_delivered_carrier_date, order_delivered_customer_date, order_estimated_delivery_date,
+           shipping_limit_date, review_creation_date, review_answer_timestamp, customer_id, customer_unique_id, customer_zip_code_prefix, order_id, review_id, product_id, seller_id) %>%
+   step_normalize(all_numeric(), -all_outcomes()) %>%
+   step_other(all_nominal(), -all_outcomes(), threshold = .02, other = "outros") %>% 
+   #step_dummy(all_nominal(), -all_outcomes(), one_hot = TRUE) %>% 
+   step_zv(all_predictors()) 
+   )
+
+(receita_prep <- prep(receita))
+
+df_visao_cliente_processada <- bake(receita_prep, new_data = NULL)
+
+df_visao_cliente_processada %>% glimpse()
+df_visao_cliente_processada %>% dim()
+
+df_visao_cliente_processada$product_height_cm %>% mean()
+df_visao_cliente_processada$product_height_cm %>% sd()
+
+```
+
+## Clusterização
+
+descobre número de cluster ideal através do método do cotovelo
+```{r}
+set.seed(321)
+#separa df grupo aleatório "pequeno" para identificar número de clusters ideal
+df_verifica_melhor_k <- df_visao_cliente_processada %>%
+  slice_sample(n = 8000, replace = FALSE)
+
+# Exibir dimensões do novo dataframe
+dim(df_verifica_melhor_k)  # Para verificar o número de linhas e colunas
+
+k <- seq(from = 2, to =50, by = 2)
+
+tabela <- tibble(k = k) %>%  #"~" é pra dizer que é na linha por linha (como o lambda do python) e o .x é o x msm se tem mais de uma coluna ex k e l seria .x1 e .x2
+  mutate(w = map_dbl(k, ~ kproto(df_verifica_melhor_k , k = .x, nstart = 10)$tot.withinss))
+
+tabela %>% 
+  ggplot(aes(k, w)) + 
+  geom_point() + 
+  scale_x_continuous(breaks = k) +
+  geom_line()
+  # k=12
+```
+
+faz a clusterização com k=12
+```{r}
+df_visao_cliente_processada_clust <- df_visao_cliente_processada %>% kproto(k = 12, nstart = 30)
+
+#resumos
+df_visao_cliente_processada_clust
+
+df_visao_cliente_processada_clust$cluster %>% str()
+
+df_visao_cliente_processada_clust$cluster %>% head()
+
+#marcações dos clusters
+df_visao_cliente_processada_clust$size
+
+# gráficos de cada cluster
+clustMixType::clprofiles(object = df_visao_cliente_processada_clust,
+                         x = df_visao_cliente_processada)
+
+# estatistico das variaveis numericas de cada cluster
+df_visao_cliente_processada_clust %>% summary()
+
+
+
+df_cliente_clusterizado <- df_visao_cliente  %>%
+  mutate(personas = as.factor(df_visao_cliente_processada_clust$cluster))
+
+df_cliente_clusterizado %>% glimpse()
+```
+
+marcando o cluster no df original
+```{r}
+# Crie uma coluna vazia no dataframe para armazenar os clusters
+df_visao_cliente %>% glimpse()
+df_visao_cliente_processada_clust$cluster %>% str()
+
+df_visao_cliente$cluster <- 0
+
+# Atribua os clusters correspondentes aos índices do dataframe
+df_visao_cliente$cluster[as.numeric(names(df_visao_cliente_processada_clust$cluster))]  <- df_visao_cliente_processada_clust$cluster
+
+df_visao_cliente %>% glimpse()
+
+df_visao_cliente$cluster %>% table()
+
+df_visao_cliente %>% na.omit() %>% pull(cluster) %>% table()
+
+df_cliente_clusterizado <- df_visao_cliente %>% na.omit()
+
+df_cliente_clusterizado %>% glimpse()
+```
+
+## salvar .CSV
+```{r}
+# Salvando a tibble como arquivo CSV na mesma pasta do código R
+write.csv(df_cliente_clusterizado, file = "df_cliente_clusterizado.csv")
+
+```
+
+import
+```{r}
+
+df_cliente_clusterizado <- read.csv("df_cliente_clusterizado.csv")
+
+df_cliente_clusterizado <- df_cliente_clusterizado %>%
+  mutate(
+          geolocation_city = as.factor(geolocation_city),
+          geolocation_state = as.factor(geolocation_state),
+          order_status = as.factor(order_status),
+          order_purchase_timestamp = as.POSIXct(order_purchase_timestamp, format = "%Y-%m-%d %H:%M:%S"),
+          order_approved_at = as.POSIXct(order_approved_at, format = "%Y-%m-%d %H:%M:%S"),
+          order_delivered_carrier_date = as.POSIXct(order_delivered_carrier_date, format = "%Y-%m-%d %H:%M:%S"),
+          order_delivered_customer_date = as.POSIXct(order_delivered_customer_date, format = "%Y-%m-%d %H:%M:%S"),
+          order_estimated_delivery_date = as.Date(order_estimated_delivery_date),
+
+          review_creation_date = as.Date(review_creation_date),
+          review_answer_timestamp = as.POSIXct(review_answer_timestamp, format = "%Y-%m-%d %H:%M:%S"),
+
+          payment_installments = as.integer(payment_installments), # número de parcelas escolhidas para efetuar pgto
+          payment_type = as.factor(payment_type),
+          shipping_limit_date = as.POSIXct(shipping_limit_date, format = "%Y-%m-%d %H:%M:%S"),
+          product_category_name = as.factor(product_category_name),
+          customer_zip_code_prefix = as.character(customer_zip_code_prefix),
+          dia_da_semana_da_compra = as.factor(dia_da_semana_da_compra),
+          numero_do_mes_da_compra = as.factor(numero_do_mes_da_compra),
+          cluster = as.factor(cluster)
+          )
+
+df_cliente_clusterizado <- df_cliente_clusterizado %>% as_tibble() %>% dplyr::select(-X)
+
+df_cliente_clusterizado_analise_grafica  <-  df_cliente_clusterizado %>% 
+select(-review_comment_title, -review_comment_message, -customer_id, -customer_unique_id, -customer_zip_code_prefix, -order_id, -review_id, -product_id, -seller_id)
+
+df_cliente_clusterizado %>% skim()
+
+df_cliente_clusterizado_analise_grafica %>% glimpse()
+df_cliente_clusterizado_analise_grafica_2 <- df_cliente_clusterizado_analise_grafica %>% filter(cluster==6)
+```
+
+## visualização dos clusters e decisão da persona
+
+```{r}
+# install.packages("esquisse")
+library(esquisse)
+esquisse::esquisser(viewer = "browser")
+```
+
+```{r}
+p3 <- df_cliente_clusterizado_analise_grafica %>%
+  group_by(cluster, review_score) %>%
+  summarise(quantidade = n()) %>%
+  ggplot() +
+  aes(x = cluster, y = quantidade, fill = as.factor(review_score)) +
+  geom_bar(stat = "identity") +
+  labs(title = "Quantidade de clientes por perfil", y = "Quantidade de pessoas", x = "Perfil de cliente") +
+  coord_flip() +
+  theme_minimal() +
+  scale_fill_brewer(palette = "RdBu", name = "Nota da Review", direction = 1) +
+  guides(fill = FALSE)
+
+# Quantidade de clientes por cluster
+p4 <- df_cliente_clusterizado_analise_grafica %>%
+  group_by(cluster, review_score) %>%
+  summarise(price = sum(price)) %>%
+  ggplot() +
+  aes(x = cluster, y = price, fill = as.factor(review_score)) +
+  geom_bar(stat = "identity") +
+  labs(title = "Valor gasto por perfil", y = "Valor total gasto", x = "Perfil de cliente") +
+  coord_flip() +
+  theme_minimal() +
+  theme_minimal() +
+  scale_fill_brewer(palette = "RdBu", name = "Nota da Review", direction = 1)  
+
+# Combina os dois gráficos
+
+(p3 + p4 ) + plot_layout(guides = "collect")
+
+
+
+# boxplot avaliações
+ggplot(df_cliente_clusterizado_analise_grafica) +
+  aes(x = cluster, y = review_score) +
+  geom_boxplot(fill = "#112446") +
+  theme_minimal()
+
+
+# Calculando o ticket médio de payment_value para cada cluster
+df_ticket_medio <- df_cliente_clusterizado_analise_grafica %>%
+  group_by(cluster) %>%
+  summarise(
+    ticket_medio = as.numeric(mean(payment_value)),
+    quantidade = n(),
+    avaliacao = mean(as.numeric(review_score)))
+
+# Calculando a média dos gastos por cluster (excluindo o cluster 8)
+media_geral <- df_cliente_clusterizado_analise_grafica$payment_value %>% mean()
+
+# Definindo os valores que deseja mostrar no eixo x
+valores_x <- c(50, 100, 200, 400, 800, 1600)
+
+# Criando o gráfico de dispersão com os clusters no eixo y
+ggplot(df_ticket_medio, aes(x = ticket_medio, y = cluster, size = quantidade)) +
+  geom_point(color = "darkgrey") + # Pintando os pontos dos clusters 8 e 11 de preto
+  geom_vline(xintercept = media_geral, linetype = "dashed", color = "blue") + # Adicionando a linha vertical da média
+  ggplot2::annotate("text", x = media_geral + 5, y = max(as.numeric(as.character(df_ticket_medio$cluster))), label = "Gasto Médio", color = "blue", hjust = 0) + # Adicionando o rótulo "Gasto Médio"
+  labs(title = "Ticket médio de cada perfil de cliente",
+       subtitle = "escala logarítmica", # Adicionando a explicação abaixo do título
+       x = "Valor médio gasto por cliente",
+       y = "Perfil de cliente",
+       size = "Quantidade de observações",
+       caption = "Fonte: Olist") +
+  theme_minimal() +
+  scale_x_continuous(trans = "log", breaks = valores_x, labels = valores_x) +
+  scale_size(range = c(2, 10)) # Definindo a faixa de tamanhos das bolinhas
+
+
+
+
+
+
+# Criando o gráfico de dispersão com os clusters no eixo y
+ p5 <- ggplot(df_ticket_medio, aes(x = ticket_medio, y = cluster, size = quantidade)) +
+  geom_point(shape = 21, color = "black", aes(fill = avaliacao), stroke = 1.0) +
+  scale_fill_gradient(low = "red", high = "blue") +
+  geom_vline(xintercept = media_geral, linetype = "dashed", color = "black") +
+  ggplot2::annotate("text", x = media_geral + 5, y = max(as.numeric(as.character(df_ticket_medio$cluster))), label = "Gasto Médio", color = "black", hjust = 0) +
+  labs(title = "Ticket médio de cada perfil de cliente",
+       subtitle = "escala logarítmica",
+       x = "Valor médio gasto por cliente",
+       y = "Perfil de cliente",
+       size = "Quantidade de observações",
+       color = "Avaliação Média", # Adicionando o título da legenda de cores
+       caption = "Fonte: Olist") +
+  theme_classic() +
+  scale_x_continuous(trans = "log", breaks = valores_x, labels = valores_x) +
+  scale_size(range = c(2, 10)) # Definindo a faixa de tamanhos das bolinhas
+
+# Reordenando o fator do eixo y com base nos valores do eixo x
+df_ticket_medio$cluster <- factor(df_ticket_medio$cluster, levels = df_ticket_medio$cluster[order(df_ticket_medio$ticket_medio)])
+
+p6 <- ggplot(df_ticket_medio, aes(x = ticket_medio, y = cluster, size = quantidade)) +
+  geom_point(shape = 21, color = "black", aes(fill = avaliacao), stroke = 1.0) +
+  scale_fill_gradient(low = "red", high = "blue") +
+  geom_vline(xintercept = media_geral, linetype = "dashed", color = "black") +
+  ggplot2::annotate("text", x = media_geral + 5, y = max(as.numeric(as.character(df_ticket_medio$cluster))), label = "Gasto Médio", color = "black", hjust = 0) +
+  labs(title = "Ticket médio de cada perfil de cliente",
+       subtitle = "escala logarítmica",
+       x = "Valor médio gasto por cliente",
+       y = "Perfil de cliente",
+       size = "Quantidade de observações",
+       color = "Avaliação Média", # Adicionando o título da legenda de cores
+       caption = "Fonte: Olist") +
+  theme_classic() +
+  scale_x_continuous(trans = "log", breaks = valores_x, labels = valores_x) +
+  scale_size(range = c(2, 10))
+
+
+p6
+
+p5/(p3 + p4 ) + plot_layout(guides = "collect")
+
+
+
+
+
+
+# pessoas que pagam com cartão de crédito tendem a se frustrar mais...
+df_cliente_clusterizado_analise_grafica %>%
+  #filter(cluster == 6)  %>%
+  group_by(payment_type, product_category_name) %>%
+  summarise(quantidade = n(), review_score = mean(review_score))  %>%
+  ggplot() +
+  aes(x = product_category_name, y = payment_type, fill = review_score) +
+  geom_tile() +
+  scale_fill_distiller(palette = "RdBu", direction = 1) +
+  theme_minimal()+
+  coord_flip()
+
+
+```
+
+## PCA para entender os principais drivers da base geral
+
+```{r}
+df_cliente_clusterizado_analise_grafica %>% glimpse()
+
+set.seed(123)
+(receita <- recipe(~ ., data = df_cliente_clusterizado_analise_grafica) %>%
+   step_rm(all_nominal(), all_datetime(), all_date()) %>%
+   step_normalize(all_numeric(), -all_outcomes()) 
+   )
+
+(receita_prep <- prep(receita))
+
+df_pre_pca <- bake(receita_prep, new_data = NULL)
+
+df_pre_pca %>% glimpse()
+
+df_pre_pca$freight_value %>% mean()
+
+#verifica medias
+colMeans(df_pre_pca)
+
+#verifica desvios padrão
+apply(df_pre_pca, 2, sd)
+
+pca <- df_pre_pca %>% prcomp(scale = FALSE)
+
+print((cumsum(pca$sdev^2) / sum(pca$sdev^2)))
+
+pca %>% str()
+#pca %>% View()
+
+pca$rotation
+
+Phi <- pca$rotation # matriz de cargas/ pesos
+Z <- scale(pca$x, center = TRUE, scale = TRUE)[,]   # faço scale novamente pq depois que rotaciona o scale sai. x = valores novos
+#Z  <- pca$x
+
+get_driver <- function(Phi, drv) {
+  tibble(variavel = rownames(Phi), 
+         carga = Phi[, drv]) %>%
+    mutate(contribuicao = 100 * carga^2 / 1) %>%
+    arrange(desc(contribuicao))
+}
+
+
+
+driver_1 <- get_driver(Phi, drv = 1)
+driver_1
+
+p_pca_1 <- pca %>% 
+  fviz_contrib(choice = "var", axes = 1, sort.val = "asc",
+               fill = "steelblue", color = "black") +
+  labs(x = "", title = "Contribuições PC1 - geral") +
+  coord_flip() #inverte x e y
+
+
+
+
+
+driver_2 <- get_driver(Phi, drv = 2)
+driver_2
+
+p_pca_2 <- pca %>% 
+  fviz_contrib(choice = "var", axes = 2, sort.val = "asc",
+               fill = "steelblue", color = "black") +
+  labs(x = "", title = "Contribuições PC2 - geral") +
+  coord_flip() #inverte x e y
+
+
+
+driver_3 <- get_driver(Phi, drv = 3)
+driver_3
+
+p_pca_3 <- pca %>% 
+  fviz_contrib(choice = "var", axes = 3, sort.val = "asc",
+               fill = "steelblue", color = "black") +
+  labs(x = "", title = "Contribuições PC3 - geral") +
+  coord_flip() #inverte x e y
+
+driver_4 <- get_driver(Phi, drv = 4)
+driver_4
+
+p_pca_4 <- pca %>% 
+  fviz_contrib(choice = "var", axes = 4, sort.val = "asc",
+               fill = "steelblue", color = "black") +
+  labs(x = "", title = "Contribuições PC4 - geral") +
+  coord_flip() #inverte x e y
+
+driver_5 <- get_driver(Phi, drv = 5)
+driver_5
+
+p_pca_5 <- pca %>% 
+  fviz_contrib(choice = "var", axes = 5, sort.val = "asc",
+               fill = "steelblue", color = "black") +
+  labs(x = "", title = "Contribuições PC5 - geral") +
+  coord_flip() #inverte x e y
+```
+
+Variancia explicada das variaveis númericas de cada PCA (peso de cada driver)
+```{r}
+# o grafico abaixo mostra o percentual explicado da variancia de cada componente
+fviz_eig(pca, addlabels = TRUE, 
+         ncp = ncol(df)-1) + # ncp - numero de componentes mostrados
+  labs(x = "Componente Principal",
+       y = "Percentual explicado da variancia") +
+  ggtitle("Relevância das componentes")
+```
+
+Principais váriaveis que compoem cada driver - geral
+```{r}
+p_pca_1 + p_pca_2 + p_pca_3 + p_pca_4 + p_pca_5
+```
+
+visão transação - principais drivers que influenciam nas compras
+visão cliente - 
+
+os principais drivers que influenciam as compras dos clientes são:
+18,1%: Preço
+9,9%: Tempo
+8,9%: Localização do Cliente e Dimensões do Produto
+8%: Localização e Preço
+6,5%: Descrição do produto
+
+
+## PCA para entender melhor a persona do perfil 6
+```{r}
+df_cliente_clusterizado_analise_grafica %>% glimpse()
+df_cliente_clusterizado_analise_grafica %>% filter(cluster==6) %>% pull(review_score) %>% mean()
+df_cliente_clusterizado_analise_grafica_2 <- df_cliente_clusterizado_analise_grafica %>% filter(cluster==6)
+
+set.seed(123)
+(receita <- recipe(~ ., data = df_cliente_clusterizado_analise_grafica_2) %>%
+   step_rm(all_nominal(), all_datetime(), all_date()) %>%
+   step_normalize(all_numeric(), -all_outcomes()) 
+   )
+
+(receita_prep <- prep(receita))
+
+df_pre_pca <- bake(receita_prep, new_data = NULL)
+
+df_pre_pca %>% glimpse()
+
+df_pre_pca$freight_value %>% mean()
+
+#verifica medias
+colMeans(df_pre_pca)
+
+#verifica desvios padrão
+apply(df_pre_pca, 2, sd)
+
+pca_6 <- df_pre_pca %>% prcomp(scale = FALSE)
+
+print((cumsum(pca_6$sdev^2) / sum(pca_6$sdev^2)))
+
+pca_6 %>% str()
+#pca %>% View()
+
+pca_6$rotation
+
+Phi <- pca_6$rotation # matriz de cargas/ pesos
+Z <- scale(pca_6$x, center = TRUE, scale = TRUE)[,]   # faço scale novamente pq depois que rotaciona o scale sai. x = valores novos
+#Z  <- pca$x
+
+get_driver <- function(Phi, drv) {
+  tibble(variavel = rownames(Phi), 
+         carga = Phi[, drv]) %>%
+    mutate(contribuicao = 100 * carga^2 / 1) %>%
+    arrange(desc(contribuicao))
+}
+
+driver_1 <- get_driver(Phi, drv = 1)
+driver_1
+
+p_pca_6_1  <- pca_6 %>% 
+  fviz_contrib(choice = "var", axes = 1, sort.val = "asc",
+               fill = "steelblue", color = "black") +
+  labs(x = "", title = "Contribuições PC1 - perfil 6") +
+  coord_flip() #inverte x e y
+
+
+driver_2 <- get_driver(Phi, drv = 2)
+driver_2
+
+p_pca_6_2  <- pca_6 %>% 
+  fviz_contrib(choice = "var", axes = 2, sort.val = "asc",
+               fill = "steelblue", color = "black") +
+  labs(x = "", title = "Contribuições PC2 - perfil 6") +
+  coord_flip() #inverte x e y
+
+driver_3 <- get_driver(Phi, drv = 3)
+driver_3
+
+p_pca_6_3  <- pca_6 %>% 
+  fviz_contrib(choice = "var", axes = 3, sort.val = "asc",
+               fill = "steelblue", color = "black") +
+  labs(x = "", title = "Contribuições PC3 - perfil 6") +
+  coord_flip() #inverte x e y
+
+driver_4 <- get_driver(Phi, drv = 4)
+driver_4
+
+p_pca_6_4  <- pca_6 %>% 
+  fviz_contrib(choice = "var", axes = 4, sort.val = "asc",
+               fill = "steelblue", color = "black") +
+  labs(x = "", title = "Contribuições PC4 - perfil 6") +
+  coord_flip() #inverte x e y
+
+driver_5 <- get_driver(Phi, drv = 5)
+driver_5
+
+p_pca_6_5  <- pca_6 %>% 
+  fviz_contrib(choice = "var", axes = 5, sort.val = "asc",
+               fill = "steelblue", color = "black") +
+  labs(x = "", title = "Contribuições PC5 - perfil 6") +
+  coord_flip() #inverte x e y
+
+```
+
+```{r}
+Z %>% skim()
+```
+
+peso das PCAs do peso 6
+```{r}
+# o grafico abaixo mostra o percentual explicado da variancia de cada componente
+fviz_eig(pca_6, addlabels = TRUE, 
+         ncp = ncol(df)-1) + # ncp - numero de componentes mostrados
+  labs(x = "Componente Principal",
+       y = "Percentual explicado da variancia") +
+  ggtitle("Relevância das componentes")
+```
+
+```{r}
+p_pca_6_1 + p_pca_6_2 + p_pca_6_3 + p_pca_6_4 + p_pca_6_5
+```
+
+```{r}
+p_pca_1 + p_pca_6_1
+```
+
+```{r}
+p_pca_2 + p_pca_6_2
+```
+
+```{r}
+p_pca_3 + p_pca_6_3
+```
+
+```{r}
+p_pca_4 + p_pca_6_4
+```
+
+```{r}
+p_pca_5 + p_pca_6_5
+```
+
+```{r}
+(p_pca_1 + p_pca_2 + p_pca_3) / (p_pca_6_1+p_pca_6_2+p_pca_6_3)
+```
+
+
+Pelo gráfico notamos que o quinto driver é "descrição do produto"
+
+principais variancias para as componentes princiipais da persona 6:
+14,9%: Preço do Produto
+10,7%: Tempo
+9,5%: Tempo
+7,5%: Localização
+6,7%: Detalhamento do produto
+
+```{r}
+df_cliente_clusterizado_analise_grafica %>%glimpse()
+set.seed(123)
+(receita <- recipe(~ ., data = df_cliente_clusterizado_analise_grafica) %>%
+   step_rm(all_nominal(), all_datetime(), all_date(), -c("cluster"))
+   )
+
+(receita_prep <- prep(receita))
+
+df_analise <- bake(receita_prep, new_data = NULL)
+
+df_analise %>% glimpse()
+```
+
+
+Gráfico da variancia das 5 principais variaveis com menos variancia do cluster
+```{r}
+# Calcular a variação de cada variável dentro de cada cluster
+vars_within_cluster <- aggregate(. ~ cluster,data = df_analise[, ], FUN = var)
+
+# Calcular média de cada coluna
+means <- colMeans(vars_within_cluster[, -1]) # Excluímos a primeira coluna que é 'cluster'
+
+# Dividir cada elemento pela média de sua coluna
+vars_within_cluster_divided <- vars_within_cluster
+vars_within_cluster_divided[, -1] <- data[, -1] / means
+
+df <- as.data.frame(t(vars_within_cluster_divided %>% filter(cluster==6) %>% select(-cluster)))  %>%
+  rownames_to_column(var = "variavel") %>%
+  rename(variancia = V1) %>%
+  arrange(variancia) %>%
+  head(5)   
+
+df  %>%
+  ggplot(aes(x = reorder(variavel, -variancia), y = variancia)) +
+  geom_bar(stat = "identity", fill = "skyblue", color = "black") +
+  labs(title = "Variância das Variáveis no Cluster 6",
+       x = "Variável",
+       y = "Variância") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  coord_flip() # Para exibir as barras horizontalmente
+
+```
+
+```{r}
+# Calcular a variação de cada variável dentro de cada cluster
+vars_within_cluster <- aggregate(. ~ cluster,data = df_analise[, ], FUN = var)
+
+# Calcular média de cada coluna
+means <- colMeans(vars_within_cluster[, -1]) # Excluímos a primeira coluna que é 'cluster'
+
+# Dividir cada elemento pela média de sua coluna
+vars_within_cluster_divided <- vars_within_cluster
+vars_within_cluster_divided[, -1] <- data[, -1] / means
+
+#_______________________
+
+# Criando listas para armazenar os data frames e gráficos
+
+lista_plots <- list()
+# Loop de 1 a 12
+for (i in 1:12) {
+    
+  lista_plots[[i]] <- as.data.frame(t(vars_within_cluster_divided %>% filter(cluster==i) %>% select(-cluster)))  %>%
+    rownames_to_column(var = "variavel") %>%
+    rename(variancia = V1) %>%
+    filter(variancia != 0) %>%
+    arrange(variancia) %>%
+    head(5) %>%
+    ggplot(aes(x = reorder(variavel, -variancia), y = variancia)) +
+    geom_bar(stat = "identity", fill = "skyblue", color = "black") +
+    labs(title = paste("Cluster", i),
+        subtitle = "quanto menor mais significativa",
+        x = NULL,
+        y = "Variância") +
+    theme(axis.text.x = element_blank()) +  # Remover os textos do eixo x
+    coord_flip() # Para exibir as barras horizontalmente
+
+}
+
+# Organizando os gráficos em um layout de 4 colunas e 3 linhas
+
+(lista_plots[[1]] | lista_plots[[2]] | lista_plots[[3]] | lista_plots[[4]]) /
+(lista_plots[[5]] | lista_plots[[6]] | lista_plots[[7]] | lista_plots[[8]]) /
+(lista_plots[[9]] | lista_plots[[10]] | lista_plots[[11]] | lista_plots[[12]])
+
+lista_plots[[11]] 
+
+```
+
+```{r}
+df_analise %>% glimpse()
+
+#tenho o df df_analise me ajude a fazer em r um grafico de dispersao de quantidade_de_formas_de__pagto e review_score pintando por cluster
+```
+
+```{r}
+ggplot(df_analise, aes(x = quantidade_de_formas_de__pagto, y = product_photos_qty, color = factor(cluster))) +
+  geom_point(size = 5) +
+  #geom_jitter() +
+  labs(x = "Quantidade de Formas de Pagamento", y = "product_photos_qty", color = "Cluster") +
+  theme_minimal()
+```
