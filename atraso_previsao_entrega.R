@@ -1,0 +1,216 @@
+---
+title: "Untitled"
+author: "Isabella Barbosa Gobbi"
+date: "2024-03-08"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+library(tidyverse)
+library(ggplot2)
+library(plotly)
+
+data <- read.csv("C:\\Users\\isabe\\Downloads\\df_cliente_clusterizado_atual.csv")
+
+data$cluster <- as.factor(data$cluster)
+
+cores <- scales::hue_pal()(length(levels(data$cluster)))
+```
+
+```{r}
+head(data)
+```
+```{r}
+#Função para calcular as estatísticas
+estatisticas <- function(variavel) {
+  minimo <- min(variavel, na.rm = TRUE)
+  maximo <- max(variavel, na.rm = TRUE)
+  media <- mean(variavel, na.rm = TRUE)
+  desvio_padrao <- sd(variavel, na.rm = TRUE)
+  distintos <- length(unique(variavel))
+  
+  return(c(Min = minimo, Max = maximo, Media = media, 'Desvio Padrao' = desvio_padrao, 'Valores Distintos' = distintos))}
+
+#Aplicando a função apenas em colunas numéricas
+estatisticas_atraso_geral <- data %>%
+  select(atraso_na_entrega) %>%
+  summarise_all(estatisticas) %>% 
+  as.data.frame()
+
+estatisticas_atraso_geral$descritiva <- c('Min','Max','Media','Desvio Padrao', 'Valores Distintos')
+
+#Reposicionando a coluna das estatisticas
+estatisticas_atraso_geral <- estatisticas_df %>%
+                      relocate(descritiva)
+
+estatisticas_atraso_geral
+```
+
+```{r}
+#Função para calcular as estatísticas
+estatisticas <- function(variavel) {
+  minimo <- min(variavel, na.rm = TRUE)
+  maximo <- max(variavel, na.rm = TRUE)
+  media <- mean(variavel, na.rm = TRUE)
+  desvio_padrao <- sd(variavel, na.rm = TRUE)
+  distintos <- length(unique(variavel))
+  
+  return(c(Min = minimo, Max = maximo, Media = media, 'Desvio Padrao' = desvio_padrao, 'Valores Distintos' = distintos))}
+
+#Aplicando a função apenas em colunas numéricas
+estatisticas_atraso_positivo <- data %>%
+  select(atraso_na_entrega) %>%
+  filter(atraso_na_entrega > 0) %>%
+  summarise_all(estatisticas) %>% 
+  as.data.frame()
+
+estatisticas_atraso_positivo$descritiva <- c('Min','Max','Media','Desvio Padrao', 'Valores Distintos')
+
+#Reposicionando a coluna das estatisticas
+estatisticas_atraso_positivo <- estatisticas_df %>%
+                      relocate(descritiva)
+
+estatisticas_atraso_positivo
+```
+
+```{r}
+#Relação previsão de entrega x atraso na entrega
+plot1 <- data %>%
+  filter(atraso_na_entrega > 0) %>%
+  ggplot(aes(x = tempo_previsto_de_entrega, y = atraso_na_entrega, color = cluster)) +
+  geom_point(alpha = 0.3) +  
+  scale_color_manual(values = cores)+
+  scale_x_log10()
+
+plot1
+```
+
+```{r}
+#Atraso médio considerando valores abaixo de zero (pedidos que foram entregues antes do prazo) E acima de zero (pedidos atrasados)        
+atraso_medio <- data %>% 
+  group_by(cluster) %>% 
+  summarise(media_atraso = mean(atraso_na_entrega))%>%
+  mutate(cluster = factor(cluster, levels = cluster[order(media_atraso, decreasing = TRUE)]))
+
+plot2 <- ggplot(atraso_medio, aes(x = cluster, y = media_atraso, fill = cluster)) +
+  geom_col() +
+  geom_text(aes(label = round(media_atraso, 0)), size = 5) +
+  labs(title = "Média de atraso na entrega por cluster",
+       x = "Atraso médio",
+       y = "Cluster")+
+    theme_minimal()
+
+plot2
+```
+
+ATRASO POSITIVO 
+
+```{r}
+#GRÁFICO DE COLUNAS EMPILHADAS - VISUALIZAÇÃO POR CLUSTER
+#Criando uma variável que indica a faixa de dias de atraso
+data$faixa_atraso_geral <- cut(data$atraso_na_entrega, 
+                      breaks = c(-Inf, 0, 1, 5, 10, 20, 30, 40, Inf), 
+                      labels = c("Entrega antecipada", "0 - 1", "1 - 5", "5 - 10", "10 - 20", "20 - 30", "30 - 40", "> 40"),
+                      include.lowest = TRUE)
+
+#Calculando a proporção de imóveis por cluster e faixa de dias de atraso
+atraso_tx_geral <- data %>%
+  group_by(cluster, faixa_atraso_geral) %>%
+  summarise(count = n()) %>%
+  group_by(cluster) %>%
+  mutate(proporcao = count / sum(count))
+
+#Coluna para indicar se o rótulo deve ser exibido (ocultando para uma visualização mais limpa)
+atraso_tx_geral$exibir_rotulo <- atraso_tx_geral$proporcao >= 0.01
+
+#Criando o gráfico de colunas empilhadas base 100 com rótulos de percentual 
+plotatrasogeral <- ggplot(atraso_tx_geral, aes(x = cluster, y = proporcao, fill = as.factor(faixa_atraso_geral))) +
+  geom_bar(stat = "identity") +
+  geom_text(aes(label = ifelse(exibir_rotulo, paste0(scales::percent(proporcao, accuracy = 1)), "")),
+            position = position_fill(vjust = 0.5), size = 3) +
+  labs(title = "Percentual de pedidos por faixa de dias de atraso na entrega por cluster",
+       x = "Cluster") +
+  labs(fill = "Dias de atraso") +
+  theme_minimal() +
+  theme(axis.text.y = element_blank(),  
+        legend.title = element_text(size = 12))  
+
+
+plotatrasogeral
+```
+
+
+```{r}
+#Atraso médio considerando somente valores acima de zero (pedidos atrasados)         
+atraso_medio_positivo <- data %>% 
+  filter(atraso_na_entrega > 0) %>%
+  group_by(cluster) %>% 
+  summarise(media_atraso_positivo = mean(atraso_na_entrega))%>%
+  mutate(cluster = factor(cluster, levels = cluster[order(media_atraso_positivo, decreasing = TRUE)]))
+
+plot4 <- ggplot(atraso_medio_positivo, aes(x = cluster, y = media_atraso_positivo, fill = cluster)) +
+  geom_col() +
+  geom_text(aes(label = round(media_atraso_positivo, 0)), size = 5) +
+  labs(title = "Média de atraso na entrega por cluster",
+       x = "Atraso médio",
+       y = "Cluster")+
+  theme_minimal()
+
+plot4
+```
+
+ATRASO POSITIVO 
+
+```{r}
+#GRÁFICO DE COLUNAS EMPILHADAS - VISUALIZAÇÃO POR CLUSTER
+#Criando uma variável que indica a faixa de dias de atraso
+data$faixa_atraso_positivo <- cut(data$atraso_na_entrega, 
+                      breaks = c(-Inf, 1, 5, 10, 20, 30, 40, Inf), 
+                      labels = c("até 1", "1 - 5", "5 - 10", "10 - 20", "20 - 30", "30 - 40", "> 40"),
+                      include.lowest = TRUE)
+
+#Calculando a proporção de imóveis por cluster e faixa de dias de atraso
+atraso_tx_positivo <- data %>%
+  filter(atraso_na_entrega > 0) %>%
+  group_by(cluster, faixa_atraso_positivo) %>%
+  summarise(count = n()) %>%
+  group_by(cluster) %>%
+  mutate(proporcao = count / sum(count))
+
+#Coluna para indicar se o rótulo deve ser exibido (ocultando para uma visualização mais limpa)
+atraso_tx_positivo$exibir_rotulo <- atraso_tx_positivo$proporcao >= 0.01
+
+#Criando o gráfico de colunas empilhadas base 100 com rótulos de percentual 
+plotatrasopositivo <- ggplot(atraso_tx_positivo, aes(x = cluster, y = proporcao, fill = as.factor(faixa_atraso_positivo))) +
+  geom_bar(stat = "identity") +
+  geom_text(aes(label = ifelse(exibir_rotulo, paste0(scales::percent(proporcao, accuracy = 1)), "")),
+            position = position_fill(vjust = 0.5), size = 3) +
+  labs(title = "Percentual de pedidos por faixa de dias de atraso na entrega por cluster (>0)",
+       x = "Cluster") +
+  labs(fill = "Dias de atraso") +
+  theme_minimal() +
+  theme(axis.text.y = element_blank(),  
+        legend.title = element_text(size = 12))  
+
+
+plotatrasopositivo
+```
+
+
+```{r}
+#Volume de compras por cluster
+contagem_order_id <- data %>%
+  group_by(cluster) %>%
+  summarise(contagem = n_distinct(order_id)) %>%
+  mutate(cluster = factor(cluster, levels = cluster[order(contagem, decreasing = TRUE)]))
+
+plot3 <- ggplot(contagem_order_id, aes(x = cluster, y = contagem, fill = cluster)) +
+  geom_col() +
+  geom_text(aes(label = contagem), vjust = -0.5, size = 5) +
+  labs(title = "Contagem de order_id por cluster",
+       x = "Cluster",
+       y = "Contagem de order_id") +
+  theme_minimal()
+
+plot3
+```
